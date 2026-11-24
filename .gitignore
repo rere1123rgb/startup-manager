@@ -1,0 +1,8 @@
+__pycache__/
+build_out/
+config.json
+last_run.json
+launcher.log
+deleted/
+*.tmp
+
