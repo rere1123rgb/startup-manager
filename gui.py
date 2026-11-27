@@ -155,7 +155,18 @@ class ItemDialog(QDialog):
         self.match_edit = QLineEdit()
         self.match_edit.setPlaceholderText('명령줄에 이 글자가 있는 것만 같은 프로그램으로 봄, 예: my_script.py '
                                            '(python 항목은 비우면 스크립트 이름)')
-        self.restart_check = QCheckBox('꺼지면 다시 켜기 (60초마다 확인, 10분에 5번 넘게 죽으면 30분 쉼)')
+        self.restart_check = QCheckBox('꺼지면 다시 켜기 (10분에 5번 넘게 죽으면 30분 쉼)')
+        self.every_spin = QSpinBox()
+        self.every_spin.setRange(60, 3600)
+        self.every_spin.setSingleStep(60)
+        self.every_spin.setSuffix(' 초')
+        self.every_spin.setValue(core.WATCH_INTERVAL)
+        every_row = QHBoxLayout()
+        every_row.addWidget(self.every_spin)
+        every_row.addWidget(QLabel('마다 꺼졌는지 확인 (일부러 잠깐 끄는 프로그램이면 길게)'))
+        every_row.addStretch(1)
+        self.restart_check.toggled.connect(self.every_spin.setEnabled)
+        self.every_spin.setEnabled(False)
         self.check_path_edit = QLineEdit()
         self.check_path_edit.setPlaceholderText(r'예: Z:\  — 실행 중인데 이 경로가 안 보이면 끄고 다시 켬 (다시 켜기 켰을 때)')
 
@@ -179,6 +190,7 @@ class ItemDialog(QDialog):
         form2.addRow('프로세스 이름', self.process_edit)
         form2.addRow('명령줄 확인', self.match_edit)
         form2.addRow('', self.restart_check)
+        form2.addRow('확인 주기', every_row)
         form2.addRow('확인할 경로', self.check_path_edit)
         form2.addRow('지연', delay_row)
         form2.addRow('창 상태', self.window_combo)
@@ -217,6 +229,7 @@ class ItemDialog(QDialog):
         self.enabled_check.setChecked(bool(it.enabled))
         self.match_edit.setText(it.match)
         self.restart_check.setChecked(bool(it.restart))
+        self.every_spin.setValue(it.watch_interval())
         self.check_path_edit.setText(it.check_path)
 
     def _browse_path(self):
@@ -255,6 +268,8 @@ class ItemDialog(QDialog):
         it.enabled = self.enabled_check.isChecked()
         it.match = self.match_edit.text().strip()
         it.restart = self.restart_check.isChecked()
+        every = self.every_spin.value()
+        it.check_every = 0 if every == core.WATCH_INTERVAL else every
         it.check_path = self.check_path_edit.text().strip().strip('"')
         if it.restart and not it.process_name():
             return self._warn('꺼지면 다시 켜려면 살아 있는지 확인할 수 있어야 합니다.\n'
@@ -291,7 +306,7 @@ class MainWindow(QMainWindow):
         self.refresh_log()
         self.refresh(initial=True)
         self.timer = QTimer(self)
-        self.timer.setInterval(5000)
+        self.timer.setInterval(10000)  # 매번 작업 스케줄러·레지스트리·프로세스를 다 읽으므로 너무 잦지 않게
         self.timer.timeout.connect(self._auto_refresh)
         self.timer.start()
 
@@ -387,12 +402,13 @@ class MainWindow(QMainWindow):
 
         # 상단 바
         top = QHBoxLayout()
-        self.launcher_label = QLabel('로그온 실행기: 확인 중…')
+        self.launcher_label = QLabel('로그온 자동 실행: 확인 중…')
+        self.launcher_label.setWordWrap(True)
         self.launcher_label.setStyleSheet('font-weight:600;')
         top.addWidget(self.launcher_label, 1)
-        self.btn_register = QPushButton('로그온 실행기 등록')
+        self.btn_register = QPushButton('로그온 때 자동 실행 켜기')
         self.btn_register.clicked.connect(self.on_register)
-        self.btn_unregister = QPushButton('등록 해제')
+        self.btn_unregister = QPushButton('로그온 때 자동 실행 끄기')
         self.btn_unregister.clicked.connect(self.on_unregister)
         self.btn_refresh = QPushButton('새로 고침')
         self.btn_refresh.clicked.connect(self.on_refresh_clicked)
@@ -434,12 +450,14 @@ class MainWindow(QMainWindow):
         # 버튼 줄
         bar = QHBoxLayout()
         self.btn_toggle = QPushButton('켜기/끄기')
-        self.btn_adopt = QPushButton('관리 실행기로 옮기기')
+        self.btn_adopt = QPushButton('시작 관리자가 켜도록 옮기기')
+        self.btn_adopt.setToolTip('Windows 자동 실행은 끄고, 대신 시작 관리자가 로그온 때 켭니다 (순서·지연·최소화 설정 가능)')
         self.btn_settings = QPushButton('설정…')
         self.btn_up = QPushButton('위로')
         self.btn_down = QPushButton('아래로')
         self.btn_run = QPushButton('지금 실행')
-        self.btn_release = QPushButton('관리 해제')
+        self.btn_release = QPushButton('시작 관리자에서 빼기')
+        self.btn_release.setToolTip('시작 관리자가 켜는 목록에서 뺍니다. 옮겨 온 항목이면 원래 Windows 자동 실행이 다시 켜집니다')
         self.btn_delete = QPushButton('목록에서 삭제')
         self.btn_delete.setToolTip('필요 없어진 항목을 아예 지웁니다 (백업을 남기고, 파일은 휴지통으로)')
         self.btn_delete.clicked.connect(self.on_delete)
@@ -496,26 +514,41 @@ class MainWindow(QMainWindow):
         try:
             info = core.launcher_task_info()
         except Exception as e:  # noqa: BLE001
-            self.launcher_label.setText(f'로그온 실행기: 확인 실패 ({e})')
+            self.launcher_label.setText(f'로그온 자동 실행: 확인 실패 ({e})')
             self._launcher_registered = None
+            self.btn_register.setText('로그온 때 자동 실행 켜기')
+            self.btn_register.setVisible(True)
+            self.btn_unregister.setVisible(False)
             return
         self._launcher_registered = info is not None
+        self._launcher_path_ok = bool(info is None or info.get('path_ok', True))
         if info is None:
-            self.launcher_label.setText('로그온 실행기: 등록 안 됨')
+            self.launcher_label.setText('로그온 자동 실행: 꺼짐 (로그온 때 아무것도 켜지 않음)')
         else:
             last = (info.get('last') or '').split('+')[0].split('.')[0].strip()
             if not last or last.startswith(('1899', '1999', '1601', '1900')):
                 last_text = '아직 실행 안 됨'
             else:
                 last_text = f'{last} ({info.get("result", "")})'
-            state = '켜짐' if info.get('enabled') else '꺼짐'
-            text = f'로그온 실행기: 등록됨 ({state}) · 마지막 실행 {last_text}'
+            state = '켜짐' if info.get('enabled') else '꺼짐 (작업 스케줄러에서 사용 안 함)'
+            text = f'로그온 자동 실행: {state} · 마지막 실행 {last_text}'
             if info.get('running'):
                 text += f' · 감시 중 (마지막 확인 {info.get("watching", "")[-8:]})'
+            if not self._launcher_path_ok:
+                text += '\n⚠ 작업 스케줄러에 적힌 프로그램 위치가 지금 위치와 다릅니다 (폴더를 옮겼나요?)'
             self.launcher_label.setText(text)
-        # 등록돼 있어도 다시 등록할 수 있게 둔다 (프로그램 폴더를 옮겼거나 새 버전일 때)
-        self.btn_register.setText('다시 등록' if self._launcher_registered else '로그온 실행기 등록')
+        # 켜기 버튼은 꺼져 있을 때만, 위치가 어긋났을 때는 '고치기'로 보인다. 끄기 버튼은 켜져 있을 때만.
+        enabled = bool(info and info.get('enabled'))
+        if not self._launcher_registered or not enabled:
+            self.btn_register.setText('로그온 때 자동 실행 켜기')
+            self.btn_register.setVisible(True)
+        elif not self._launcher_path_ok:
+            self.btn_register.setText('자동 실행 경로를 지금 위치로 고치기')
+            self.btn_register.setVisible(True)
+        else:
+            self.btn_register.setVisible(False)
         self.btn_register.setEnabled(True)
+        self.btn_unregister.setVisible(bool(self._launcher_registered))
         self.btn_unregister.setEnabled(bool(self._launcher_registered))
 
     def refresh_log(self):
@@ -648,7 +681,7 @@ class MainWindow(QMainWindow):
             for e in es:
                 name = e.name + ('   🛡' if e.needs_admin else '')
                 if e.adopted_by:
-                    state = '관리 실행기로 옮김'
+                    state = '시작 관리자가 켬'
                 else:
                     state = '켜짐' if e.enabled else '꺼짐'
                 run = '?' if e.running is None else ('● 실행 중' if e.running else '–')
@@ -670,6 +703,8 @@ class MainWindow(QMainWindow):
                         row.setForeground(c, grey)
                 elif e.enabled:
                     row.setForeground(1, QBrush(QColor('#1a6fd0')))
+                if core.STOPPED_PREFIX in (e.detail or ''):
+                    row.setForeground(3, QBrush(QColor('#c62828')))
                 head.addChild(row)
                 if sel and e.key == sel:
                     select_item = row
@@ -699,7 +734,7 @@ class MainWindow(QMainWindow):
             e.source == 'task' and e.name == core.LAUNCHER_TASK) and not (
             e.source == 'managed' and e.name == core.SELF_ITEM_NAME)
         self.btn_delete.setEnabled(deletable and not busy)
-        # 설정(최소화·지연 등)은 Run·폴더 항목에도 연다: 저장하면 관리 실행기로 옮겨진다.
+        # 설정(최소화·지연 등)은 Run·폴더 항목에도 연다: 저장하면 시작 관리자가 켜도록 옮겨진다.
         self.btn_settings.setEnabled(bool(e and (managed or adoptable or e.adopted_by)) and not busy)
         self.btn_new.setEnabled(not busy)
 
@@ -734,6 +769,18 @@ class MainWindow(QMainWindow):
                 return it
         return None
 
+    def _notify(self, text: str, ms: int = 3000) -> None:
+        """잠깐 보여 주고 저절로 닫히는 알림. 떠 있는 동안에도 다른 조작을 막지 않는다."""
+        box = QMessageBox(QMessageBox.Icon.Information, APP_TITLE, text, QMessageBox.StandardButton.Ok, self)
+        box.button(QMessageBox.StandardButton.Ok).setText('확인')
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        t = QTimer(box)  # 알림 창의 자식: 먼저 닫혀도 타이머가 같이 사라짐
+        t.setSingleShot(True)
+        t.timeout.connect(box.close)
+        t.start(ms)
+        box.show()
+
     def _confirm(self, text: str, title: str = APP_TITLE) -> bool:
         box = QMessageBox(QMessageBox.Icon.Question, title, text,
                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
@@ -744,26 +791,33 @@ class MainWindow(QMainWindow):
 
     # ── 상단 바 동작 ──
     def on_register(self):
-        if not self._confirm('로그온할 때 관리 항목을 켜 주는 "로그온 실행기"를 작업 스케줄러에 등록할까요?\n'
-                             '(일반 권한으로 등록되며 언제든 해제할 수 있습니다.)'):
+        fixing = bool(self._launcher_registered) and not getattr(self, '_launcher_path_ok', True)
+        if fixing:
+            q = ('작업 스케줄러에 적힌 시작 관리자 위치를 지금 위치로 고칠까요?\n'
+                 f'({core.APP_DIR})')
+        else:
+            q = ('로그온 때 시작 관리자가 자동으로 켜지게 할까요?\n'
+                 '켜지면 트레이에 뜨고, "시작 관리자가 켜는 항목"을 순서대로 켭니다.\n'
+                 '(작업 스케줄러에 일반 권한으로 등록되며 언제든 끌 수 있습니다.)')
+        if not self._confirm(q):
             return
 
         def after(_):
             self.refresh_launcher_status()
-            self.statusBar().showMessage('로그온 실행기를 등록했습니다.')
+            self.statusBar().showMessage('자동 실행 경로를 고쳤습니다.' if fixing else '로그온 때 자동 실행을 켰습니다.')
 
-        self.run_task(core.register_launcher, after, '로그온 실행기 등록 중…', refresh=False)
+        self.run_task(core.register_launcher, after, '로그온 자동 실행 설정 중…', refresh=False)
 
     def on_unregister(self):
-        if not self._confirm('로그온 실행기 등록을 해제할까요?\n'
-                             '해제하면 로그온 때 관리 항목이 자동으로 켜지지 않습니다.'):
+        if not self._confirm('로그온 때 자동 실행을 끌까요?\n'
+                             '끄면 로그온 때 시작 관리자와 "시작 관리자가 켜는 항목"이 자동으로 켜지지 않습니다.'):
             return
 
         def after(_):
             self.refresh_launcher_status()
-            self.statusBar().showMessage('로그온 실행기 등록을 해제했습니다.')
+            self.statusBar().showMessage('로그온 때 자동 실행을 껐습니다.')
 
-        self.run_task(core.unregister_launcher, after, '등록 해제 중…', refresh=False)
+        self.run_task(core.unregister_launcher, after, '로그온 자동 실행 끄는 중…', refresh=False)
 
     # ── 행 동작 ──
     def on_toggle(self):
@@ -781,13 +835,13 @@ class MainWindow(QMainWindow):
         if not e or not e.source.startswith(ADOPTABLE_PREFIX) or e.adopted_by:
             return
         if not self._confirm(
-                f'"{e.name}" 을(를) 관리 실행기로 옮길까요?\n\n'
-                '· 원래 항목은 그대로 남지만 꺼집니다.\n'
-                '· 대신 로그온 실행기가 이 프로그램을 로그온 때 켭니다 (순서·지연·최소화 설정 가능).\n'
-                '· 나중에 "관리 해제"를 누르면 원래 항목이 다시 켜집니다.'):
+                f'"{e.name}" 을(를) 시작 관리자가 켜도록 옮길까요?\n\n'
+                '· 원래 Windows 자동 실행 항목은 그대로 남지만 꺼집니다.\n'
+                '· 대신 시작 관리자가 이 프로그램을 로그온 때 켭니다 (순서·지연·최소화 설정 가능).\n'
+                '· 나중에 "시작 관리자에서 빼기"를 누르면 원래 항목이 다시 켜집니다.'):
             return
         self.run_task(lambda: core.adopt(e), lambda it: self.statusBar().showMessage(
-            f'"{e.name}" 을(를) 관리 실행기로 옮겼습니다.'), f'"{e.name}" 옮기는 중…',
+            f'"{e.name}" 을(를) 시작 관리자가 켜도록 옮겼습니다.'), f'"{e.name}" 옮기는 중…',
             keep_key=e.key)
 
     def on_settings(self):
@@ -807,13 +861,13 @@ class MainWindow(QMainWindow):
                 return
             new = dlg.item()
             if not self._confirm(
-                    f'"{e.name}" 설정을 적용하려면 관리 실행기로 옮겨야 합니다.\n\n'
-                    '· 원래 항목은 그대로 남지만 꺼집니다.\n'
-                    '· 로그온 때 로그온 실행기가 이 설정(최소화·지연·중복 방지)대로 켭니다.\n'
-                    '· 나중에 "관리 해제"를 누르면 원래대로 돌아갑니다.'):
+                    f'"{e.name}" 설정을 적용하려면 시작 관리자가 켜도록 옮겨야 합니다.\n\n'
+                    '· 원래 Windows 자동 실행 항목은 그대로 남지만 꺼집니다.\n'
+                    '· 로그온 때 시작 관리자가 이 설정(최소화·지연·중복 방지)대로 켭니다.\n'
+                    '· 나중에 "시작 관리자에서 빼기"를 누르면 원래대로 돌아갑니다.'):
                 return
             self.run_task(lambda: core.adopt(e, new), lambda it: self.statusBar().showMessage(
-                f'"{e.name}" 을(를) 관리 실행기로 옮기고 설정을 저장했습니다.'), f'"{e.name}" 옮기는 중…',
+                f'"{e.name}" 을(를) 시작 관리자가 켜도록 옮기고 설정을 저장했습니다.'), f'"{e.name}" 옮기는 중…',
                 keep_key=f'managed:{new.id}')
             return
         item_id = e.managed_id if e.source == 'managed' else e.adopted_by
@@ -851,7 +905,10 @@ class MainWindow(QMainWindow):
         extra = ' (Steam 은 로그인될 때까지 몇 분 걸릴 수 있습니다)' if it.type == 'steam' else ''
 
         def after(result):
-            QMessageBox.information(self, APP_TITLE, f'"{it.name}": {result}')
+            if str(result).startswith('실패'):
+                QMessageBox.warning(self, APP_TITLE, f'"{it.name}": {result}')
+            else:
+                self._notify(f'"{it.name}": {result}')
             self.statusBar().showMessage(f'"{it.name}": {result}')
 
         self.run_task(lambda: core.launch_item(it), after, f'"{it.name}" 실행 중…{extra}', keep_key=e.key)
@@ -861,23 +918,23 @@ class MainWindow(QMainWindow):
         if not e or e.source != 'managed':
             return
         it = self._find_item(e.managed_id)
-        text = f'"{e.name}" 을(를) 관리 실행기에서 해제할까요?\n\n· 관리 목록에서 이 항목이 삭제됩니다.\n'
+        text = f'"{e.name}" 을(를) 시작 관리자에서 뺄까요?\n\n· 시작 관리자가 켜는 목록에서 이 항목이 빠집니다.\n'
         if it and it.origin:
-            text += '· 다른 출처(레지스트리/시작프로그램 폴더)에서 옮겨 온 항목이면 원래 항목이 다시 켜집니다.\n'
+            text += '· 레지스트리/시작프로그램 폴더에서 옮겨 온 항목이라 원래 항목이 다시 켜집니다.\n'
         else:
-            text += '· 직접 만든 항목이라 되돌릴 원래 항목은 없습니다.\n'
+            text += '· 직접 만든 항목이라 되돌릴 원래 항목은 없습니다 (로그온 때 더는 켜지지 않음).\n'
         if not self._confirm(text):
             return
         self.run_task(lambda: core.release(e.managed_id),
-                      lambda _: self.statusBar().showMessage(f'"{e.name}" 을(를) 해제했습니다.'),
-                      f'"{e.name}" 해제 중…')
+                      lambda _: self.statusBar().showMessage(f'"{e.name}" 을(를) 시작 관리자에서 뺐습니다.'),
+                      f'"{e.name}" 빼는 중…')
 
     def on_delete(self):
         e = self.selected_entry()
         if not e or not self.btn_delete.isEnabled():
             return
         what = {
-            'managed': '관리 실행기 목록에서 지웁니다.',
+            'managed': '시작 관리자가 켜는 목록에서 지웁니다.',
             'task': '작업 스케줄러에서 작업을 삭제합니다.',
             'folder_user': '바로 가기 파일을 휴지통으로 보냅니다.',
             'folder_common': '바로 가기 파일을 휴지통으로 보냅니다.',

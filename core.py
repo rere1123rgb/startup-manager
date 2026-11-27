@@ -47,7 +47,7 @@ RUN32_SUBKEY = r'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
 APPROVED = r'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
 
 SOURCE_LABELS = {
-    'managed': '관리 실행기',
+    'managed': '시작 관리자가 켜는 항목',
     'task': '작업 스케줄러',
     'run_hkcu': '레지스트리 Run (사용자)',
     'run_hklm': '레지스트리 Run (모든 사용자)',
@@ -315,6 +315,7 @@ class Item:
     match: str = ''               # 명령줄에 이 글자가 들어 있는 프로세스만 '같은 프로그램'으로 봄 (예: my_script.py)
     restart: bool = False         # 꺼지면 다시 켜기 (실행기가 주기적으로 확인)
     check_path: str = ''          # 이 경로가 있어야 정상으로 봄 (예: Z:\). 프로세스는 있는데 경로가 없으면 끄고 다시 켬
+    check_every: int = 0          # 꺼졌는지 확인하는 주기(초). 0이면 기본값 WATCH_INTERVAL
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def _is_python(self) -> bool:
@@ -343,12 +344,25 @@ class Item:
                 return name
         return ''
 
+    def watch_interval(self) -> int:
+        return self.check_every if self.check_every and self.check_every > 0 else WATCH_INTERVAL
+
     def describe(self) -> str:
         if self.type == 'steam':
             return f'steam://rungameid/{self.appid}'
         if self.type == 'task':
             return f'작업 스케줄러 작업 "{self.task}" 실행'
         return f'"{self.path}" {self.args}'.strip()
+
+
+def interval_text(sec: int) -> str:
+    if sec % 3600 == 0:
+        return f'{sec // 3600}시간'
+    if sec % 60 == 0:
+        return f'{sec // 60}분'
+    if sec > 60:
+        return f'{sec // 60}분 {sec % 60}초'
+    return f'{sec}초'
 
 
 def load_items() -> list[Item]:
@@ -520,14 +534,16 @@ def list_entries() -> list[Entry]:
         detail = f'마지막 {rec["time"]} {rec["result"]}' if rec else '아직 실행 기록 없음'
         opts = []
         if it.delay:
-            opts.append(f'{it.delay}초 뒤')
+            opts.append(f'{it.delay}초 기다린 뒤 켬')
         if it.window == 'minimized':
             opts.append('최소화')
         if it.restart:
-            opts.append('꺼지면 다시 켬')
+            opts.append(f'꺼지면 다시 켬({interval_text(it.watch_interval())}마다 확인)')
         if it.check_path:
             opts.append(f'{it.check_path} 확인')
-        if opts:
+        if rec and str(rec.get('result', '')).startswith(STOPPED_PREFIX):
+            detail = f'{rec["result"]} · {rec["time"]}'  # 경고는 잘리지 않게 맨 앞에
+        elif opts:
             detail = '[' + ', '.join(opts) + '] ' + detail
         proc = it.process_name()
         try:
@@ -653,7 +669,7 @@ def item_from_entry(entry: Entry) -> Item:
 def adopt(entry: Entry, item: Item | None = None) -> Item:
     """Run·폴더 항목을 관리 실행기로 옮긴다: 관리 항목(item, 없으면 기본값)을 저장하고 원래 항목은 끈다(값은 남김)."""
     if entry.adopted_by:
-        raise ValueError('이미 관리 실행기로 옮긴 항목입니다.')
+        raise ValueError('이미 시작 관리자가 켜도록 옮긴 항목입니다.')
     if item is None:
         item = item_from_entry(entry)
     item.origin = {'source': entry.source, 'name': entry.name}
@@ -724,7 +740,7 @@ def delete_entry(entry: Entry) -> str:
     """항목을 목록에서 아예 지운다. 지우기 전 내용을 DATA_DIR\\deleted 에 백업하고, 파일은 휴지통으로 보낸다.
     관리 항목이면 옮겨 오기 전 원래 항목(꺼 둔 Run 값·바로 가기)도 같이 지운다. 백업 위치 문구를 돌려준다."""
     if entry.source == 'task' and entry.name == LAUNCHER_TASK:
-        raise ValueError('시작 관리자 자신의 로그온 작업은 "등록 해제"로 지워 주세요.')
+        raise ValueError('시작 관리자 자신의 로그온 작업은 "로그온 때 자동 실행 끄기"로 지워 주세요.')
     if entry.source == 'managed':
         items = load_items()
         item = next((it for it in items if it.id == entry.managed_id), None)
@@ -956,15 +972,22 @@ def run_all() -> None:
         t.join()
     record['finished'] = now_text()
     _save_last_run(record)
-    log('── 로그온 실행 끝, 감시 시작 (꺼지면 다시 켜기 항목을 60초마다 확인) ──')
+    log(f'── 로그온 실행 끝, 감시 시작 (꺼지면 다시 켜기 항목을 항목별 주기(기본 {WATCH_INTERVAL}초)로 확인) ──')
     watch_loop(record)
     del mutex
 
 
-WATCH_INTERVAL = 60          # 감시 주기 (초)
+WATCH_INTERVAL = 60          # 기본 감시 주기 (초). 항목마다 check_every 로 바꿀 수 있음
+WATCH_TICK = 5               # 감시 루프가 깨어나는 간격 (초)
 RESTART_LIMIT = 5            # RESTART_WINDOW 안에 이만큼 다시 켜면
 RESTART_WINDOW = 600         # (초)
 RESTART_PAUSE = 1800         # 이 시간 동안 다시 켜기를 쉰다 (계속 죽는 프로그램 무한 재시작 방지)
+VERIFY_WAITS = (30, 60, 120)  # 다시 켠 뒤 떴는지 확인하는 간격 (초). 끝까지 안 보이면 감시를 멈춤
+STOPPED_PREFIX = '⚠ 감시 멈춤'
+
+
+def _item_sig(item: Item) -> str:
+    return json.dumps(item.__dict__, ensure_ascii=False, sort_keys=True)
 
 
 def watch_loop(record: dict) -> None:
@@ -978,9 +1001,29 @@ def watch_loop(record: dict) -> None:
             items = []
         now = time.time()
         for item in items:
-            st = state.setdefault(item.id, {'path_fail': 0, 'restarts': [], 'paused_until': 0.0})
+            st = state.setdefault(item.id, {'path_fail': 0, 'restarts': [], 'paused_until': 0.0,
+                                            'last_check': 0.0, 'verify': None, 'stopped': ''})
+            sig = _item_sig(item)
+            if st['stopped']:
+                if st['stopped'] == sig:
+                    continue  # 감시 멈춤: 설정을 고쳐 저장하면 다시 시작
+                log(f'{item.name}: 설정이 바뀌어 감시를 다시 시작')
+                record['items'][item.id] = {'time': now_text(), 'result': '설정이 바뀌어 감시 다시 시작'}
+                st.update(stopped='', verify=None, restarts=[], paused_until=0.0, last_check=0.0)
+            if st['verify']:
+                try:
+                    result = _verify_one(item, st, now, sig)
+                except Exception as e:
+                    log(f'{item.name}: 확인 중 예외 {e!r}')
+                    result = ''
+                if result:
+                    record['items'][item.id] = {'time': now_text(), 'result': result}
+                continue
             if now < st['paused_until']:
                 continue
+            if now - st['last_check'] < item.watch_interval() - WATCH_TICK:  # 루프 지연 감안해 약간 여유
+                continue
+            st['last_check'] = now
             try:
                 result = _watch_one(item, st)
             except Exception as e:
@@ -988,12 +1031,37 @@ def watch_loop(record: dict) -> None:
                 result = ''
             if result:
                 record['items'][item.id] = {'time': now_text(), 'result': result}
+            if result.startswith('다시 켬: 켬'):
+                # 켠 뒤 정말 떴는지 30초 → 1분 → 2분 뒤에 확인 (판단이 틀려 헛도는 것 방지)
+                st['verify'] = {'step': 0, 'at': time.time() + VERIFY_WAITS[0]}
         record['watching'] = now_text()
         try:
             _save_last_run(record)
         except Exception:
             pass
-        time.sleep(WATCH_INTERVAL)
+        time.sleep(WATCH_TICK)
+
+
+def _verify_one(item: Item, st: dict, now: float, sig: str) -> str:
+    v = st['verify']
+    if now < v['at']:
+        return ''
+    if find_pids(item):
+        st['verify'] = None
+        st['last_check'] = now
+        return ''
+    v['step'] += 1
+    if v['step'] < len(VERIFY_WAITS):
+        wait = VERIFY_WAITS[v['step']]
+        log(f'{item.name}: 다시 켰는데 아직 안 보임, {interval_text(wait)} 뒤 다시 확인')
+        v['at'] = now + wait
+        return ''
+    st['verify'] = None
+    st['stopped'] = sig
+    total = interval_text(sum(VERIFY_WAITS))
+    log(f'{item.name}: 다시 켜고 {total} 넘게 기다렸지만 안 보여 감시를 멈춤 '
+        f'(이미 켜져 있는데 못 알아보는 것일 수 있음. 프로세스 이름·명령줄 확인 설정을 확인하세요)')
+    return f'{STOPPED_PREFIX}: 다시 켰는데도 안 보임 (프로세스 이름·명령줄 확인 설정 확인 필요)'
 
 
 def _watch_one(item: Item, st: dict) -> str:
@@ -1039,14 +1107,32 @@ def pythonw_path() -> str:
     return str(cand if cand.exists() else exe)
 
 
+def launcher_command() -> tuple[str, str]:
+    """로그온 작업이 실행해야 할 (프로그램, 인수). 지금 이 프로그램 위치 기준."""
+    if FROZEN:
+        return sys.executable, '--launch'
+    return pythonw_path(), f'"{APP_DIR / "launcher.py"}"'
+
+
+def _norm_cmd(path: str, args: str) -> str:
+    return (os.path.normcase(os.path.normpath(path.strip().strip('"'))) + '|' + ' '.join(args.split())).lower()
+
+
 def launcher_task_info() -> dict | None:
     try:
         task = _task_service().GetFolder('\\').GetTask(LAUNCHER_TASK)
     except pywintypes.com_error:
         return None
+    path_ok_ = True
+    try:  # 작업에 적힌 경로가 지금 프로그램 위치와 같은지 (폴더를 옮겼으면 다름)
+        want = _norm_cmd(*launcher_command())
+        path_ok_ = any(_norm_cmd(a.Path or '', a.Arguments or '') == want
+                       for a in task.Definition.Actions if a.Type == 0)
+    except Exception:
+        pass
     return {'enabled': bool(task.Enabled), 'last': str(task.LastRunTime),
             'result': task_result_text(task.LastTaskResult), 'running': task.State == 4,
-            'watching': load_last_run().get('watching', '')}
+            'watching': load_last_run().get('watching', ''), 'path_ok': path_ok_}
 
 
 def register_launcher() -> None:
@@ -1065,12 +1151,7 @@ def register_launcher() -> None:
     td.Settings.ExecutionTimeLimit = 'PT0S'  # 감시를 계속하므로 시간 제한 없음
     td.Settings.MultipleInstances = 2  # 이미 돌면 새로 안 켬
     action = td.Actions.Create(0)
-    if FROZEN:
-        action.Path = sys.executable
-        action.Arguments = '--launch'
-    else:
-        action.Path = pythonw_path()
-        action.Arguments = f'"{APP_DIR / "launcher.py"}"'
+    action.Path, action.Arguments = launcher_command()
     action.WorkingDirectory = str(APP_DIR)
     svc.GetFolder('\\').RegisterTaskDefinition(LAUNCHER_TASK, td, 6, None, None, 3)
     ensure_self_item()
