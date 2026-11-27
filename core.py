@@ -274,15 +274,26 @@ def visible_windows(pids: set[int]) -> list[int]:
     return found
 
 
+MINIMIZE_RETRY_LIMIT = 5  # 최소화한 창이 이보다 많이 다시 펼쳐지면 프로그램이 스스로 되돌리는 것으로 보고 그만둠
+
+
 def keep_minimized(item: 'Item', label: str, wait_seconds: int = 120, hold_seconds: int = 20) -> None:
-    """창이 뜨기를 기다렸다 최소화하고, 그 뒤 hold_seconds 동안 다시 펼쳐지면 또 최소화한다."""
+    """창이 뜨기를 기다렸다 최소화하고, 그 뒤 hold_seconds 동안 다시 펼쳐지면 또 최소화한다.
+
+    게임처럼 처음에 한두 번 다시 펼쳐지는 건 따라가서 최소화하지만, 프로그램이 스스로 계속 되돌리면
+    (창 숨김 유틸 등) 서로 싸우게 되므로 MINIMIZE_RETRY_LIMIT 번 넘게 펼쳐지면 그만둔다.
+    """
     deadline = time.time() + wait_seconds
     first_done = None
     count = 0
-    while time.time() < deadline:
+    gave_up = False
+    while time.time() < deadline and not gave_up:
         pids = set(find_pids(item))
         for hwnd in visible_windows(pids):
             if not win32gui.IsIconic(hwnd):
+                if count > MINIMIZE_RETRY_LIMIT:
+                    gave_up = True
+                    break
                 win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
                 count += 1
                 if first_done is None:
@@ -291,6 +302,9 @@ def keep_minimized(item: 'Item', label: str, wait_seconds: int = 120, hold_secon
         time.sleep(0.5)
     if first_done is None:
         log(f'{label}: {wait_seconds}초 동안 창이 안 보여 최소화 못 함')
+    elif gave_up:
+        log(f'{label}: 최소화해도 프로그램이 스스로 계속 다시 펼쳐서 ({count - 1}번) 그만둠 '
+            f'— 이 항목은 창 상태를 "보통"으로 두는 게 맞을 수 있음')
     else:
         log(f'{label}: 최소화함' + (f' (다시 펼쳐져 {count - 1}번 더)' if count > 1 else ''))
 
@@ -1006,10 +1020,20 @@ def watch_loop(record: dict) -> None:
             sig = _item_sig(item)
             if st['stopped']:
                 if st['stopped'] == sig:
-                    continue  # 감시 멈춤: 설정을 고쳐 저장하면 다시 시작
-                log(f'{item.name}: 설정이 바뀌어 감시를 다시 시작')
-                record['items'][item.id] = {'time': now_text(), 'result': '설정이 바뀌어 감시 다시 시작'}
-                st.update(stopped='', verify=None, restarts=[], paused_until=0.0, last_check=0.0)
+                    # 감시 멈춤: 설정을 고쳐 저장하면 다시 시작. 경로 때문에 멈췄으면 경로가 돌아올 때도 다시 시작
+                    if not st.get('stopped_path') or now - st['last_check'] < item.watch_interval() - WATCH_TICK:
+                        continue
+                    st['last_check'] = now
+                    if not path_ok(item.check_path):
+                        continue
+                    log(f'{item.name}: {item.check_path} 가 다시 보여 감시를 다시 시작')
+                    record['items'][item.id] = {'time': now_text(), 'result': f'{item.check_path} 돌아와 감시 다시 시작'}
+                else:
+                    log(f'{item.name}: 설정이 바뀌어 감시를 다시 시작')
+                    record['items'][item.id] = {'time': now_text(), 'result': '설정이 바뀌어 감시 다시 시작'}
+                st.update(stopped='', stopped_path=False, verify=None, restarts=[], paused_until=0.0,
+                          last_check=0.0, path_fail=0)
+                continue
             if st['verify']:
                 try:
                     result = _verify_one(item, st, now, sig)
@@ -1033,7 +1057,8 @@ def watch_loop(record: dict) -> None:
                 record['items'][item.id] = {'time': now_text(), 'result': result}
             if result.startswith('다시 켬: 켬'):
                 # 켠 뒤 정말 떴는지 30초 → 1분 → 2분 뒤에 확인 (판단이 틀려 헛도는 것 방지)
-                st['verify'] = {'step': 0, 'at': time.time() + VERIFY_WAITS[0]}
+                st['verify'] = {'step': 0, 'at': time.time() + VERIFY_WAITS[0],
+                                'need_path': st.pop('relaunch_reason', '') == '경로 없음'}
         record['watching'] = now_text()
         try:
             _save_last_run(record)
@@ -1046,22 +1071,31 @@ def _verify_one(item: Item, st: dict, now: float, sig: str) -> str:
     v = st['verify']
     if now < v['at']:
         return ''
-    if find_pids(item):
+    pids = find_pids(item)
+    path_back = (not v.get('need_path')) or path_ok(item.check_path)
+    if pids and path_back:
         st['verify'] = None
         st['last_check'] = now
         return ''
     v['step'] += 1
     if v['step'] < len(VERIFY_WAITS):
         wait = VERIFY_WAITS[v['step']]
-        log(f'{item.name}: 다시 켰는데 아직 안 보임, {interval_text(wait)} 뒤 다시 확인')
+        what = '안 보임' if not pids else f'{item.check_path} 가 아직 안 보임'
+        log(f'{item.name}: 다시 켰는데 {what}, {interval_text(wait)} 뒤 다시 확인')
         v['at'] = now + wait
         return ''
     st['verify'] = None
     st['stopped'] = sig
     total = interval_text(sum(VERIFY_WAITS))
-    log(f'{item.name}: 다시 켜고 {total} 넘게 기다렸지만 안 보여 감시를 멈춤 '
-        f'(이미 켜져 있는데 못 알아보는 것일 수 있음. 프로세스 이름·명령줄 확인 설정을 확인하세요)')
-    return f'{STOPPED_PREFIX}: 다시 켰는데도 안 보임 (프로세스 이름·명령줄 확인 설정 확인 필요)'
+    if not pids:
+        log(f'{item.name}: 다시 켜고 {total} 넘게 기다렸지만 안 보여 감시를 멈춤 '
+            f'(이미 켜져 있는데 못 알아보는 것일 수 있음. 프로세스 이름·명령줄 확인 설정을 확인하세요)')
+        return f'{STOPPED_PREFIX}: 다시 켰는데도 안 보임 (프로세스 이름·명령줄 확인 설정 확인 필요)'
+    st['stopped_path'] = True
+    st['last_check'] = now
+    log(f'{item.name}: 다시 켜고 {total} 넘게 기다렸지만 {item.check_path} 가 돌아오지 않아 감시를 멈춤 '
+        f'(다시 켜서 해결되는 문제가 아닌 것 같음. 네트워크·드라이브 상태를 확인하세요. 경로가 돌아오면 감시를 다시 시작함)')
+    return f'{STOPPED_PREFIX}: 다시 켜도 {item.check_path} 가 안 돌아옴 (네트워크·드라이브 확인 필요)'
 
 
 def _watch_one(item: Item, st: dict) -> str:
@@ -1096,6 +1130,7 @@ def _watch_one(item: Item, st: dict) -> str:
             f'{RESTART_PAUSE // 60}분 쉼 (계속 죽는 것 같음)')
         return f'다시 켜기 잠시 멈춤 ({RESTART_PAUSE // 60}분)'
     log(f'{item.name}: {reason} → 다시 켬')
+    st['relaunch_reason'] = reason
     return '다시 켬: ' + launch_item(item)
 
 
@@ -1124,15 +1159,29 @@ def launcher_task_info() -> dict | None:
     except pywintypes.com_error:
         return None
     path_ok_ = True
+    task_cmd = ''
+    want_path, want_args = launcher_command()
     try:  # 작업에 적힌 경로가 지금 프로그램 위치와 같은지 (폴더를 옮겼으면 다름)
-        want = _norm_cmd(*launcher_command())
-        path_ok_ = any(_norm_cmd(a.Path or '', a.Arguments or '') == want
-                       for a in task.Definition.Actions if a.Type == 0)
+        want = _norm_cmd(want_path, want_args)
+        acts = [a for a in task.Definition.Actions if a.Type == 0]
+        path_ok_ = any(_norm_cmd(a.Path or '', a.Arguments or '') == want for a in acts)
+        if acts:
+            task_cmd = _launcher_dir(acts[0].Path or '', acts[0].Arguments or '')
     except Exception:
         pass
     return {'enabled': bool(task.Enabled), 'last': str(task.LastRunTime),
             'result': task_result_text(task.LastTaskResult), 'running': task.State == 4,
-            'watching': load_last_run().get('watching', ''), 'path_ok': path_ok_}
+            'watching': load_last_run().get('watching', ''), 'path_ok': path_ok_,
+            'task_dir': task_cmd, 'want_dir': _launcher_dir(want_path, want_args)}
+
+
+def _launcher_dir(path: str, args: str) -> str:
+    """로그온 작업 명령에서 '시작 관리자가 있는 폴더'를 뽑는다 (pythonw 면 스크립트 폴더, exe 면 exe 폴더)."""
+    path = path.strip().strip('"')
+    if Path(path).name.lower() in PYTHON_EXES and args.strip():
+        script = args.strip().split('"')[1] if args.strip().startswith('"') else args.split()[0]
+        return str(Path(script).parent)
+    return str(Path(path).parent)
 
 
 def register_launcher() -> None:

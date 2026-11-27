@@ -534,9 +534,16 @@ class MainWindow(QMainWindow):
             text = f'로그온 자동 실행: {state} · 마지막 실행 {last_text}'
             if info.get('running'):
                 text += f' · 감시 중 (마지막 확인 {info.get("watching", "")[-8:]})'
+            tip = ''
             if not self._launcher_path_ok:
-                text += '\n⚠ 작업 스케줄러에 적힌 프로그램 위치가 지금 위치와 다릅니다 (폴더를 옮겼나요?)'
+                old_dir, new_dir = info.get('task_dir', ''), info.get('want_dir', '')
+                text += ('\n⚠ 로그온 때 켜지는 시작 관리자가 지금 이 시작 관리자와 다른 폴더에 있습니다'
+                         f'\n    로그온 때 켜는 것: {old_dir or "(알 수 없음)"}\n    지금 이 프로그램: {new_dir}')
+                tip = (f'작업 스케줄러의 "{core.LAUNCHER_TASK}" 작업(시작 관리자 자신의 자동 실행)이\n'
+                       '다른 폴더의 시작 관리자를 켜도록 적혀 있습니다. 폴더를 옮겼거나 다른 복사본이면\n'
+                       '"자동 실행 경로를 지금 위치로 고치기"를 누르세요.')
             self.launcher_label.setText(text)
+            self.launcher_label.setToolTip(tip)
         # 켜기 버튼은 꺼져 있을 때만, 위치가 어긋났을 때는 '고치기'로 보인다. 끄기 버튼은 켜져 있을 때만.
         enabled = bool(info and info.get('enabled'))
         if not self._launcher_registered or not enabled:
